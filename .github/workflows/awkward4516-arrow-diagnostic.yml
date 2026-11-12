@@ -1,0 +1,237 @@
+# Diagnostic draft only; independently review before publication.
+name: Awkward 4516 isolated Arrow diagnostic
+on:
+  push:
+    branches: [validation/awkward4516-arrow17-20261112-a]
+permissions:
+  contents: read
+jobs:
+  compare:
+    if: >-
+      github.repository == 'dhairyajangir/awkward' &&
+      github.ref == 'refs/heads/validation/awkward4516-arrow17-20261112-a' &&
+      github.event.created == true && github.event.after == github.sha
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      BASE: d967790539625c0b88bb6f4dc5ecf7a8400ea5d9
+      PR_HEAD: 9f123c9e1ace178eb399395f4b6dca113f721149
+      MERGE: 933d4ff37f026bd85c8165e8c30ebcd4227ff30c
+      MERGE_TREE: cb5e5452499fce1957f8a1170d7d7ae9c0ca692d
+      SOURCE_DATE_EPOCH: 1668811211
+      PYTHONFAULTHANDLER: 1
+      PIP_ONLY_BINARY: numpy,pandas,pyarrow
+    steps:
+      - name: Check out diagnostic carrier
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Validate exact carrier and public PR inputs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EVENT_SHA"
+          test "$(git rev-parse HEAD^)" = "$BASE"
+          test "$(git show -s --format=%P HEAD | wc -w)" -eq 1
+          mapfile -t changed < <(git diff --name-only "$BASE" HEAD)
+          test "${#changed[@]}" -eq 2
+          test "${changed[0]}" = '.github/workflows/awkward4516-arrow-diagnostic.yml'
+          test "${changed[1]}" = 'diagnostics/awkward4516-arrow-diagnostic.py'
+          printf '%s  %s\n' '764bec1dc1a241d9205d39621fdc55b36bf400e752616a20efed42a951e893e6' diagnostics/awkward4516-arrow-diagnostic.py | sha256sum -c -
+          gh api repos/scikit-hep/awkward/pulls/4516 | jq -e \
+            --arg head "$PR_HEAD" '.state == "open" and .head.sha == $head and .head.repo.full_name == "dhairyajangir/awkward" and .base.repo.full_name == "scikit-hep/awkward" and .base.ref == "main"' >/dev/null
+          main=$(gh api repos/scikit-hep/awkward/git/ref/heads/main --jq .object.sha)
+          test "$main" = "$BASE"
+      - name: Set up Python 3.10.22
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.10.22'
+      - name: Fetch and verify exact baseline and tested merge
+        shell: bash
+        run: |
+          set -euo pipefail
+          ulimit -c 0
+          python -VV
+          uname -a
+          ldd --version | head -1
+          git fetch --no-tags --depth=2 https://github.com/scikit-hep/awkward.git \
+            '+refs/pull/4516/merge:refs/remotes/diagnostic/pull-merge'
+          test "$(git rev-parse refs/remotes/diagnostic/pull-merge)" = "$MERGE"
+          test "$(git rev-parse "$MERGE^{tree}")" = "$MERGE_TREE"
+          test "$(git show -s --format=%P "$MERGE")" = "$BASE $PR_HEAD"
+          test "$(git rev-parse "$BASE:awkward-cpp")" = "$(git rev-parse "$MERGE:awkward-cpp")"
+          git worktree add --detach "$RUNNER_TEMP/awkward-base" "$BASE"
+          git worktree add --detach "$RUNNER_TEMP/awkward-merge" "$MERGE"
+          git -C "$RUNNER_TEMP/awkward-base" submodule update --init --depth 1
+          test "$(git -C "$RUNNER_TEMP/awkward-base/awkward-cpp/rapidjson" rev-parse HEAD)" = d621dc9e9c77f81e5c8a35b8dcc16dcd63351321
+          git -C "$RUNNER_TEMP/awkward-merge" submodule update --init --depth 1
+          test "$(git -C "$RUNNER_TEMP/awkward-merge/awkward-cpp/rapidjson" rev-parse HEAD)" = d621dc9e9c77f81e5c8a35b8dcc16dcd63351321
+          git diff --name-status "$BASE" "$MERGE"
+      - name: Prepare exact sources and build one common C++ wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install build nox
+          python -m pip freeze
+          (cd "$RUNNER_TEMP/awkward-base" && python -m nox -s prepare)
+          (cd "$RUNNER_TEMP/awkward-merge" && python -m nox -s prepare)
+          for source in base merge; do
+            git -C "$RUNNER_TEMP/awkward-$source" diff --exit-code
+            git -C "$RUNNER_TEMP/awkward-$source" diff --cached --exit-code
+            git -C "$RUNNER_TEMP/awkward-$source" status --short
+          done
+          python - <<'PYCODE'
+          import hashlib, json, os
+          from pathlib import Path
+          root=Path(os.environ['RUNNER_TEMP'])
+          def collect(source, component):
+              start=root / f'awkward-{source}' / component
+              assert start.is_dir(), start
+              records={}
+              for path in sorted(start.rglob('*')):
+                  rel=path.relative_to(start)
+                  if '.git' in rel.parts or '__pycache__' in rel.parts or path.suffix in ('.pyc','.pyo'):
+                      continue
+                  if component == 'src/awkward' and rel.as_posix() == 'contents/indexedarray.py':
+                      continue
+                  if path.is_file():
+                      records[rel.as_posix()]=hashlib.sha256(path.read_bytes()).hexdigest()
+              return records
+          manifests={}
+          for component in ('awkward-cpp', 'src/awkward'):
+              before=collect('base',component)
+              after=collect('merge',component)
+              assert before == after, f'Prepared {component} differs beyond allowed source file'
+              digest=hashlib.sha256(json.dumps(before,sort_keys=True).encode()).hexdigest()
+              print('PREPARED_MATCH',component,'files',len(before),'manifest_sha256',digest,flush=True)
+              manifests[component]=before
+          (root/'prepared-source-manifests.json').write_text(json.dumps(manifests,sort_keys=True))
+          PYCODE
+          test "$(git -C "$RUNNER_TEMP/awkward-base" hash-object src/awkward/contents/indexedarray.py)" = 506b5da1f71ca41cdc5fc03debad5d41a261554a
+          test "$(git -C "$RUNNER_TEMP/awkward-merge" hash-object src/awkward/contents/indexedarray.py)" = 725ac5ad2e0b900a42d0c2f4be32b048b1e72e0a
+          mkdir "$RUNNER_TEMP/awkward-cpp-wheel"
+          python -m build --wheel --outdir "$RUNNER_TEMP/awkward-cpp-wheel" "$RUNNER_TEMP/awkward-base/awkward-cpp"
+          shopt -s nullglob
+          wheels=("$RUNNER_TEMP"/awkward-cpp-wheel/awkward_cpp-57-*.whl)
+          test "${#wheels[@]}" -eq 1
+          sha256sum "${wheels[0]}"
+          printf '%s\n' "${wheels[0]}" > "$RUNNER_TEMP/wheel-path"
+      - name: Install separate comparison environments
+        shell: bash
+        run: |
+          set -euo pipefail
+          wheel=$(cat "$RUNNER_TEMP/wheel-path")
+          for source in base merge; do
+            for arrow in 17.0.0 18.1.0; do
+              envdir="$RUNNER_TEMP/venv-$source-$arrow"
+              python -m venv "$envdir"
+              "$envdir/bin/python" -m pip install \
+                'numpy==1.21.3' 'pandas==1.3.4' "pyarrow==$arrow" \
+                'fsspec==2026.9.0' 'packaging==26.3' 'importlib-metadata==9.0.1' \
+                'typing-extensions==4.16.0' 'python-dateutil==3.0.0' \
+                'pytz==2026.6' 'six==1.17.0' 'tzdata==2026.6' 'zipp==4.1.2'
+              "$envdir/bin/python" -m pip install --no-deps "$wheel"
+              "$envdir/bin/python" -m pip install --no-deps -e "$RUNNER_TEMP/awkward-$source"
+              "$envdir/bin/python" -m pip check
+              "$envdir/bin/python" -m pip freeze
+              EXPECTED_SOURCE_ROOT="$RUNNER_TEMP/awkward-$source" \
+              NATIVE_OUTPUT="$RUNNER_TEMP/native-$source-$arrow.json" \
+              "$envdir/bin/python" - <<'PYCODE'
+          import hashlib, json, os, pathlib, subprocess, sys
+          import awkward, awkward_cpp.libawkward, awkward_cpp.cpu_kernels, awkward_cpp.lib._ext
+          import numpy, numpy.core._multiarray_umath, pyarrow, pyarrow.lib
+          source=pathlib.Path(os.environ['EXPECTED_SOURCE_ROOT']).resolve()
+          assert pathlib.Path(awkward.__file__).resolve().is_relative_to(source)
+          paths={'awkward': pathlib.Path(awkward_cpp.libawkward.lib._name).resolve(),
+                 'awkward_kernels': pathlib.Path(awkward_cpp.cpu_kernels.lib._name).resolve(),
+                 'awkward_extension': pathlib.Path(awkward_cpp.lib._ext.__file__).resolve(),
+                 'numpy': pathlib.Path(numpy.core._multiarray_umath.__file__).resolve(),
+                 'pyarrow': pathlib.Path(pyarrow.lib.__file__).resolve()}
+          records={}
+          for name, path in paths.items():
+              assert path.is_file(), (name,str(path))
+              link=subprocess.check_output(['ldd',str(path)],text=True)
+              print('NATIVE_LINKAGE',name,str(path),'\n'+link,flush=True)
+              records[name]={'path':str(path),'sha256':hashlib.sha256(path.read_bytes()).hexdigest()}
+              for line in link.splitlines():
+                  parts=line.strip().split()
+                  if len(parts)>=3 and parts[1]=='=>' and parts[2].startswith('/') and ('arrow' in parts[0] or 'awkward' in parts[0]):
+                      dep=pathlib.Path(parts[2]).resolve()
+                      records[name+':'+parts[0]]={'path':str(dep),'sha256':hashlib.sha256(dep.read_bytes()).hexdigest()}
+          print('VERSIONS',sys.executable,awkward.__file__,numpy.__version__,pyarrow.__version__,pyarrow.cpp_version,flush=True)
+          pathlib.Path(os.environ['NATIVE_OUTPUT']).write_text(json.dumps(records,sort_keys=True))
+          PYCODE
+            done
+          done
+          python - <<'PYCODE'
+          import json, os
+          from pathlib import Path
+          root=Path(os.environ['RUNNER_TEMP'])
+          all_records={}
+          for source in ('base','merge'):
+              for arrow in ('17.0.0','18.1.0'):
+                  path=root/f'native-{source}-{arrow}.json'
+                  data=json.loads(path.read_text())
+                  all_records[source,arrow]={k:v['sha256'] for k,v in data.items()}
+                  print('NATIVE_HASHES',source,arrow,all_records[source,arrow],flush=True)
+          for arrow in ('17.0.0','18.1.0'):
+              assert all_records['base',arrow] == all_records['merge',arrow], f'native binaries differ for {arrow}'
+          for key in ('awkward','awkward_kernels','awkward_extension'):
+              assert all_records['base','17.0.0'][key] == all_records['base','18.1.0'][key], f'common wheel mismatch: {key}'
+          PYCODE
+          for source in base merge; do
+            git -C "$RUNNER_TEMP/awkward-$source" diff --exit-code
+            git -C "$RUNNER_TEMP/awkward-$source" diff --cached --exit-code
+          done
+          python - <<'PYCODE'
+          import hashlib, json, os
+          from pathlib import Path
+          root=Path(os.environ['RUNNER_TEMP'])
+          expected=json.loads((root/'prepared-source-manifests.json').read_text())
+          generated_versions={}
+          for source in ('base','merge'):
+              for component in ('awkward-cpp','src/awkward'):
+                  start=root/f'awkward-{source}'/component
+                  records={}
+                  for path in sorted(start.rglob('*')):
+                      rel=path.relative_to(start)
+                      if '.git' in rel.parts or '__pycache__' in rel.parts or path.suffix in ('.pyc','.pyo'):
+                          continue
+                      if component == 'awkward-cpp' and rel.parts[0] == 'build':
+                          continue
+                      if component == 'src/awkward' and rel.as_posix() == 'contents/indexedarray.py':
+                          continue
+                      if component == 'src/awkward' and rel.as_posix() == '_version.py' and '_version.py' not in expected[component] and path.is_file():
+                          generated_versions[source]=hashlib.sha256(path.read_bytes()).hexdigest()
+                          continue
+                      if path.is_file():
+                          records[rel.as_posix()]=hashlib.sha256(path.read_bytes()).hexdigest()
+                  assert records == expected[component], f'post-install source changed: {source}/{component}'
+                  print('POST_INSTALL_MATCH',source,component,'files',len(records),flush=True)
+          if generated_versions:
+              assert set(generated_versions) == {'base','merge'} and generated_versions['base'] == generated_versions['merge'], generated_versions
+              print('EDITABLE_GENERATED_VERSION_MATCH',generated_versions['base'],flush=True)
+          PYCODE
+          for source in base merge; do
+            if test -f "$RUNNER_TEMP/awkward-$source/src/awkward/_version.py"; then
+              test -z "$(git -C "$RUNNER_TEMP/awkward-$source" ls-files -- src/awkward/_version.py)"
+            fi
+          done
+          test "$(git -C "$RUNNER_TEMP/awkward-base" hash-object src/awkward/contents/indexedarray.py)" = 506b5da1f71ca41cdc5fc03debad5d41a261554a
+          test "$(git -C "$RUNNER_TEMP/awkward-merge" hash-object src/awkward/contents/indexedarray.py)" = 725ac5ad2e0b900a42d0c2f4be32b048b1e72e0a
+      - name: Compare isolated subprocess cases
+        shell: bash
+        run: |
+          set -euo pipefail
+          ulimit -c 0
+          export DIAGNOSTIC_ENVS="$(python - <<'PY'
+          import json, os
+          root=os.environ['RUNNER_TEMP']
+          print(json.dumps([{'source':s,'path':f'{root}/awkward-{s}', 'arrow':a,'python':f'{root}/venv-{s}-{a}/bin/python'} for s in ('base','merge') for a in ('17.0.0','18.1.0')]))
+          PY
+          )"
+          python diagnostics/awkward4516-arrow-diagnostic.py
